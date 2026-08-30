@@ -27,10 +27,10 @@ Both scopes also discover a `plugins/` directory. No build step and no dependenc
 
 ## Behavior details
 
-- Files are stored at `<opencode data dir>/v1-attachments/<sessionID>/<name>`. The data dir respects `XDG_DATA_HOME`. Set `OPENCODE_ATTACHMENT_DIR` to use a different root.
-- Filenames are sanitized: path separators and traversal sequences are stripped, unicode is NFC-normalized, bidi control characters are removed, Windows device names are neutralized, and length is capped. An empty result falls back to a generated name. Name collisions within a session get `-2`, `-3`, … suffixes; a retry of the same message reuses the existing file instead of duplicating it.
-- Each file is capped at 25 MiB. Oversized or undecodable attachments are skipped with an explanatory text part instead of failing the turn — a plugin failure never breaks a message.
-- There is no quota or automatic cleanup. The `v1-attachments` directory is safe to delete whenever opencode is not mid-turn.
+- Files are stored at `<opencode data dir>/v1-attachments/<sessionID>/<name>`. The data dir respects `XDG_DATA_HOME`. Set `OPENCODE_ATTACHMENT_DIR` to use a different root. Relative values for either environment variable resolve against the opencode server's working directory, and the appended path is always absolute.
+- Filenames are sanitized: directory components are stripped, Unicode is NFC-normalized, bidi and control characters are removed, Windows device names are neutralized, and length is capped. An empty result falls back to a generated name. Name collisions within one message and different-length collisions get `-2`, `-3`, … suffixes. After 1,000 numeric collisions, the plugin uses a short random suffix. A later attachment with the same sanitized name and byte length reuses the existing path as the retry heuristic.
+- Each file is capped at 25 MiB. The decoder accepts padded or unpadded base64, the standard or URL-safe alphabet, ASCII whitespace, and metadata such as `;charset=utf-8` before `;base64`. A data URL without the `;base64` marker is not decoded. Oversized or undecodable attachments are skipped with an explanatory text part instead of failing the turn. A plugin failure never breaks a message.
+- There is no quota or automatic cleanup. You can delete the `v1-attachments` directory when no turn is using its files, but deletion makes paths recorded in older messages stop resolving.
 
 ## Development
 
