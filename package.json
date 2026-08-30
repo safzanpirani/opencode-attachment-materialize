@@ -1,0 +1,17 @@
+{
+  "name": "opencode-attachment-materialize",
+  "version": "1.0.0",
+  "description": "opencode v1 plugin that saves GUI-attached files to disk and injects the real path into the turn, so agent tools can operate on any attachment",
+  "license": "MIT",
+  "type": "module",
+  "repository": "github:safzanpirani/opencode-attachment-materialize",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.25",
+    "@types/bun": "1.3.13",
+    "typescript": "5.8.2"
+  }
+}
