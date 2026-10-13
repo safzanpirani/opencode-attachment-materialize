@@ -1,11 +1,15 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { randomUUID } from "node:crypto"
-import { lstat, mkdir, realpath, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readdir, realpath, rm, utimes, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { setTimeout as delay } from "node:timers/promises"
 
 const MAX_FILE_BYTES = 25 * 1024 * 1024
 const MAX_NAME_BYTES = 180
+const DEFAULT_TOTAL_BYTES = 1024 * 1024 * 1024
+const DEFAULT_TOTAL_FILES = 10_000
+const CLEANUP_GRACE_MS = 7 * 24 * 60 * 60 * 1000
 const MAX_EXTENSION_BYTES = 24
 const MAX_COLLISION_ATTEMPTS = 1_000
 const MAX_RANDOM_ATTEMPTS = 8
@@ -169,15 +173,119 @@ const writeExclusive = async (file: string, bytes: Buffer) =>
       throw error
     })
 
+const sessionName = (id: string) => encodeURIComponent(id).replaceAll(".", "%2E") || "unknown-session"
+
+const quota = (name: string, fallback: number) => {
+  const value = process.env[name]
+  if (value === undefined) return fallback
+  const parsed = Number(value)
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`)
+  }
+  return parsed
+}
+
+// The root-wide lock covers accounting, writes, and cleanup across plugin instances
+// and server processes. Fail closed rather than steal a possibly active lock.
+const withStorageLock = async <T>(root: string, action: () => Promise<T>) => {
+  await mkdir(root, { recursive: true, mode: 0o700 })
+  const lock = join(root, ".materialize-lock")
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await mkdir(lock, { mode: 0o700 })
+      break
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+      if (attempt >= 50) throw new Error("attachment storage is busy; a stopped server may have left .materialize-lock behind")
+      await delay(100)
+    }
+  }
+  try {
+    return await action()
+  } finally {
+    await rm(lock, { recursive: true })
+  }
+}
+
+const storageUsage = async (root: string) => {
+  const usage = { bytes: 0, files: 0 }
+  const walk = async (directory: string): Promise<void> => {
+    for (const name of await readdir(directory)) {
+      if (directory === root && name === ".materialize-lock") continue
+      const path = directChild(directory, join(directory, name))
+      const info = await lstat(path)
+      if (info.isSymbolicLink()) continue
+      if (info.isDirectory()) await walk(path)
+      if (info.isFile()) {
+        usage.bytes += info.size
+        usage.files++
+      }
+    }
+  }
+  await walk(root)
+  return usage
+}
+
+const cleanup = async (root: string, context: Parameters<Plugin>[0], currentSession?: string) => {
+  const candidates = new Map<string, string>()
+  for (const name of await readdir(root)) {
+    // Only opencode session directories are ours; never follow symlinks.
+    if (!/^ses_[A-Za-z0-9_-]+$/.test(name) || name === sessionName(currentSession ?? "")) continue
+    const directory = directChild(root, join(root, name))
+    const info = await lstat(directory)
+    if (info.isDirectory() && !info.isSymbolicLink() && Date.now() - info.mtimeMs >= CLEANUP_GRACE_MS) {
+      candidates.set(name, directory)
+    }
+  }
+  if (candidates.size === 0) return
+
+  // A project-local list is insufficient: a fork or another project's history
+  // can still contain paths into a deleted session. Any incomplete API read
+  // aborts the entire sweep, before deleting anything.
+  const projects = await context.client.project.list({ throwOnError: true })
+  if (!projects.data) throw new Error("cannot enumerate attachment owners")
+  const directories = new Set([context.directory, ...projects.data.map((project) => project.worktree)])
+  const sessions = new Map<string, { id: string; directory: string; parentID?: string }>()
+  for (const directory of directories) {
+    const result = await context.client.session.list({ query: { directory }, throwOnError: true })
+    if (!result.data) throw new Error("cannot enumerate attachment sessions")
+    for (const session of result.data) sessions.set(session.id, session)
+  }
+  for (const session of sessions.values()) {
+    candidates.delete(sessionName(session.id))
+    if (session.parentID) candidates.delete(sessionName(session.parentID))
+  }
+  if (candidates.size === 0) return
+  for (const session of sessions.values()) {
+    const result = await context.client.session.messages({
+      path: { id: session.id }, query: { directory: session.directory }, throwOnError: true,
+    })
+    if (!result.data) throw new Error("cannot enumerate attachment references")
+    for (const message of result.data) {
+      const history = JSON.stringify(message)
+      for (const [name, directory] of candidates) {
+        // Inspect all part types, including tool input/output and forked notes.
+        if (history.includes(JSON.stringify(directory).slice(1, -1))) candidates.delete(name)
+      }
+    }
+  }
+  for (const directory of candidates.values()) await rm(directory, { recursive: true })
+}
+
 const save = async (
   root: string,
   session: string,
   name: string,
   bytes: Buffer,
   claimed: Set<string>,
-  active: Set<string>,
+  reuse: boolean,
+  usage: { bytes: number; files: number },
+  limits: { bytes: number; files: number },
 ) => {
   const directory = directChild(root, join(root, session))
+  if (!(await existingInfo(directory)) && (usage.bytes + bytes.byteLength > limits.bytes || usage.files + 1 > limits.files)) {
+    throw new Error(`attachment storage quota reached (${limits.bytes} bytes, ${limits.files} files); existing session files are retained`)
+  }
   await mkdir(directory, { recursive: true, mode: 0o700 })
   const directoryInfo = await lstat(directory)
   if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) {
@@ -191,32 +299,36 @@ const save = async (
 
   const attempt = async (candidate: string, allowReuse: boolean) => {
     const file = directChild(directory, join(directory, candidate))
-    if (claimed.has(file) || active.has(file)) return undefined
-    active.add(file)
-    try {
-      const info = await existingInfo(file)
-      if (allowReuse && info?.isFile() && !info.isSymbolicLink() && info.size === bytes.byteLength) {
-        await verifyFile(file, realDirectory)
-        claimed.add(file)
-        return file
-      }
-      if (info) return undefined
-      // TODO(review): Portable Node/Bun APIs cannot prevent a same-UID attacker from swapping the session directory between verification and this write without openat-style primitives.
-      if (await writeExclusive(file, bytes)) {
-        await verifyFile(file, realDirectory)
-        claimed.add(file)
-        return file
-      }
-      const raced = await existingInfo(file)
-      if (allowReuse && raced?.isFile() && !raced.isSymbolicLink() && raced.size === bytes.byteLength) {
-        await verifyFile(file, realDirectory)
-        claimed.add(file)
-        return file
-      }
-      return undefined
-    } finally {
-      active.delete(file)
+    if (claimed.has(file)) return undefined
+    const info = await existingInfo(file)
+    if (reuse && allowReuse && info?.isFile() && !info.isSymbolicLink() && info.size === bytes.byteLength) {
+      await verifyFile(file, realDirectory)
+      const now = new Date()
+      await utimes(directory, now, now)
+      claimed.add(file)
+      return file
     }
+    if (info) return undefined
+    if (usage.bytes + bytes.byteLength > limits.bytes || usage.files + 1 > limits.files) {
+      throw new Error(`attachment storage quota reached (${limits.bytes} bytes, ${limits.files} files); existing session files are retained`)
+    }
+    // Portable Node/Bun APIs cannot prevent a same-UID directory swap here without openat-style primitives.
+    if (await writeExclusive(file, bytes)) {
+      usage.bytes += bytes.byteLength
+      usage.files++
+      await verifyFile(file, realDirectory)
+      claimed.add(file)
+      return file
+    }
+    const raced = await existingInfo(file)
+    if (reuse && allowReuse && raced?.isFile() && !raced.isSymbolicLink() && raced.size === bytes.byteLength) {
+      await verifyFile(file, realDirectory)
+      const now = new Date()
+      await utimes(directory, now, now)
+      claimed.add(file)
+      return file
+    }
+    return undefined
   }
 
   for (let count = 1; count <= MAX_COLLISION_ATTEMPTS; count++) {
@@ -230,11 +342,27 @@ const save = async (
   throw new Error("attachment has too many filename collisions")
 }
 
-export const AttachmentMaterialize: Plugin = async () => {
-  const active = new Set<string>()
+export const AttachmentMaterialize: Plugin = async (context) => {
+  const pending = new Set<string>()
+  const sweep = async (root: string, currentSession?: string) => {
+    try {
+      await cleanup(root, context, currentSession)
+    } catch (error) {
+      console.error(`[attachment-materialize] cleanup skipped: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
   return {
+    event: async ({ event }) => {
+      if (event.type !== "session.deleted") return
+      try {
+        await withStorageLock(attachmentRoot(), () => sweep(attachmentRoot()))
+      } catch (error) {
+        console.error(`[attachment-materialize] cleanup skipped: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    },
     "chat.message": async (input, output) => {
       const claimed = new Set<string>()
+      let swept = false
       const appendText = (text: string) =>
         output.parts.push({
           id: `prt_${randomUUID().replaceAll("-", "")}`,
@@ -254,15 +382,29 @@ export const AttachmentMaterialize: Plugin = async () => {
               appendText(`Attachment not materialized: ${label} is ${content.size} bytes and exceeds the 25 MiB limit.`)
               return
             }
-            const session = encodeURIComponent(input.sessionID).replaceAll(".", "%2E") || "unknown-session"
-            const file = await save(
-              attachmentRoot(),
-              session,
-              safeName(part.filename, part.id),
-              content.bytes,
-              claimed,
-              active,
-            )
+            const root = attachmentRoot()
+            const session = sessionName(input.sessionID)
+            const name = safeName(part.filename, part.id)
+            const key = join(root, session, name)
+            const reuse = !pending.has(key)
+            if (reuse) pending.add(key)
+            let file: string
+            try {
+              file = await withStorageLock(root, async () => {
+                const limits = {
+                  bytes: quota("OPENCODE_ATTACHMENT_MAX_BYTES", DEFAULT_TOTAL_BYTES),
+                  files: quota("OPENCODE_ATTACHMENT_MAX_FILES", DEFAULT_TOTAL_FILES),
+                }
+                if (!swept) {
+                  await sweep(root, input.sessionID)
+                  swept = true
+                }
+                const usage = await storageUsage(root)
+                return save(root, session, name, content.bytes, claimed, reuse, usage, limits)
+              })
+            } finally {
+              if (reuse) pending.delete(key)
+            }
             appendText(
               `Attached file saved to: ${file} (${part.mime || "unknown MIME type"}, ${content.bytes.byteLength} bytes)`,
             )
