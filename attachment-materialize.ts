@@ -226,8 +226,10 @@ const storageUsage = async (root: string) => {
   return usage
 }
 
-// One listing per project; a full page means it may be truncated.
+// One listing per project; a full page means it may be truncated. A server
+// that ignores `limit` returns its default page of 100 newest sessions.
 const SESSION_LIST_LIMIT = 100_000
+const SERVER_DEFAULT_LIMIT = 100
 
 const cleanup = async (root: string, context: Parameters<Plugin>[0], currentSession?: string, incoming = "") => {
   const candidates = new Map<string, string>()
@@ -261,7 +263,10 @@ const cleanup = async (root: string, context: Parameters<Plugin>[0], currentSess
     // Without scope and limit, opencode lists only the 100 newest sessions whose directory is exactly this one.
     const query = { directory, scope: "project", limit: SESSION_LIST_LIMIT }
     const result = await context.client.session.list({ query, throwOnError: true })
-    if (!result.data || result.data.length >= SESSION_LIST_LIMIT) throw new Error("cannot enumerate attachment sessions")
+    const count = result.data?.length
+    if (count === undefined || count >= SESSION_LIST_LIMIT || count === SERVER_DEFAULT_LIMIT) {
+      throw new Error("cannot enumerate attachment sessions")
+    }
     for (const session of result.data) sessions.set(session.id, session)
   }
   for (const session of sessions.values()) {
@@ -276,11 +281,13 @@ const cleanup = async (root: string, context: Parameters<Plugin>[0], currentSess
     if (!result.data) throw new Error("cannot enumerate attachment references")
     for (const message of result.data) referenced(JSON.stringify(message))
   }
-  for (const [name, directory] of candidates) {
-    // Delete only what opencode confirms is gone: a listing can still miss a session.
+  // A candidate whose session still exists proves the listing missed it, and
+  // with it that session's history: abort before deleting anything.
+  for (const name of candidates.keys()) {
     const result = await context.client.session.get({ path: { id: name } })
-    if (result.response?.status === 404) await rm(directory, { recursive: true })
+    if (result.response?.status !== 404) throw new Error("session listing is incomplete")
   }
+  for (const directory of candidates.values()) await rm(directory, { recursive: true })
 }
 
 const save = async (

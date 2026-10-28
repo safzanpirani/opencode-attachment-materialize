@@ -91,6 +91,7 @@ const storageHooks = async (options: {
   histories?: Record<string, unknown[]>
   failHistory?: string
   unlisted?: string[]
+  legacyList?: boolean
 } = {}) => {
   const queried: string[] = []
   const sessions = options.sessions ?? []
@@ -101,12 +102,13 @@ const storageHooks = async (options: {
       project: { list: async () => ({ data: [{ worktree: "/project-two" }] }) },
       session: {
         // Like opencode: without scope=project only exact-directory matches, newest 100 unless limit is given.
-        list: async ({ query }: { query: { directory: string; scope?: string; limit?: number } }) => {
-          queried.push(query.directory)
+        list: async ({ query: { directory, scope, limit } }: { query: { directory: string; scope?: string; limit?: number } }) => {
+          queried.push(directory)
+          if (options.legacyList) scope = limit = undefined
           const listed = sessions.filter((session) =>
-            query.scope === "project" ? project(session.directory) === project(query.directory) : session.directory === query.directory,
+            scope === "project" ? project(session.directory) === project(directory) : session.directory === directory,
           )
-          return { data: listed.slice(0, query.limit ?? 100) }
+          return { data: listed.slice(0, limit ?? 100) }
         },
         get: async ({ path }: { path: { id: string } }) =>
           [...sessions.map((session) => session.id), ...(options.unlisted ?? [])].includes(path.id)
@@ -229,11 +231,21 @@ describe("bounded attachment storage", () => {
     expect(await Bun.file(orphan).exists()).toBe(false)
   })
 
-  test("keeps a session opencode still has even when no listing returns it", async () => {
+  test("aborts the sweep when opencode still has a session no listing returned", async () => {
     const hidden = await oldAttachment("ses_hidden")
+    const orphan = await oldAttachment("ses_orphan")
     const { hooks } = await storageHooks({ unlisted: ["ses_hidden"] })
     await run([file({ name: "new.bin" })], {}, hooks)
     expect(await readFile(hidden, "utf8")).toBe("test")
+    expect(await readFile(orphan, "utf8")).toBe("test")
+  })
+
+  test("aborts the sweep when a server ignores the listing limit", async () => {
+    const orphan = await oldAttachment("ses_orphan")
+    const sessions = Array.from({ length: 150 }, (_, i) => ({ id: `ses_${i}`, directory: "/project-one" }))
+    const { hooks } = await storageHooks({ sessions, legacyList: true })
+    await run([file({ name: "new.bin" })], {}, hooks)
+    expect(await readFile(orphan, "utf8")).toBe("test")
   })
 
   test("keeps an old attachment named by the message being materialized", async () => {
