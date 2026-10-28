@@ -90,17 +90,28 @@ const storageHooks = async (options: {
   sessions?: { id: string; directory: string; parentID?: string }[]
   histories?: Record<string, unknown[]>
   failHistory?: string
+  unlisted?: string[]
 } = {}) => {
   const queried: string[] = []
+  const sessions = options.sessions ?? []
+  const project = (directory: string) => ["/project-one", "/project-two"].find((root) => directory === root || directory.startsWith(`${root}/`))
   const hooks = await AttachmentMaterialize({
     directory: "/project-one",
     client: {
       project: { list: async () => ({ data: [{ worktree: "/project-two" }] }) },
       session: {
-        list: async ({ query }: { query: { directory: string } }) => {
+        // Like opencode: without scope=project only exact-directory matches, newest 100 unless limit is given.
+        list: async ({ query }: { query: { directory: string; scope?: string; limit?: number } }) => {
           queried.push(query.directory)
-          return { data: (options.sessions ?? []).filter((session) => session.directory === query.directory) }
+          const listed = sessions.filter((session) =>
+            query.scope === "project" ? project(session.directory) === project(query.directory) : session.directory === query.directory,
+          )
+          return { data: listed.slice(0, query.limit ?? 100) }
         },
+        get: async ({ path }: { path: { id: string } }) =>
+          [...sessions.map((session) => session.id), ...(options.unlisted ?? [])].includes(path.id)
+            ? { data: { id: path.id }, response: { status: 200 } }
+            : { error: { name: "NotFoundError" }, response: { status: 404 } },
         messages: async ({ path }: { path: { id: string } }) => {
           if (path.id === options.failHistory) throw new Error("history unavailable")
           return { data: options.histories?.[path.id] ?? [] }
@@ -195,6 +206,42 @@ describe("bounded attachment storage", () => {
     expect(await readFile(first, "utf8")).toBe("test")
     expect(await readFile(second, "utf8")).toBe("test")
     expect(await readdir(root)).not.toContain(".materialize-lock")
+  })
+
+  test("keeps sessions beyond opencode's default listing and paths they reference", async () => {
+    const sessions = Array.from({ length: 101 }, (_, i) => ({ id: `ses_${String(i).padStart(3, "0")}`, directory: "/project-one" }))
+    const oldest = await oldAttachment("ses_100")
+    const nested = await oldAttachment("ses_nested")
+    const gone = await oldAttachment("ses_gone")
+    const orphan = await oldAttachment("ses_orphan")
+    const { hooks } = await storageHooks({
+      sessions: [
+        ...sessions,
+        { id: "ses_nested", directory: "/project-one/packages/app" },
+        { id: "ses_fork", directory: "/project-two/sub" },
+      ],
+      histories: { ses_fork: [{ parts: [{ type: "text", text: `Attached file saved to: ${gone}` }] }] },
+    })
+    await run([file({ name: "new.bin" })], {}, hooks)
+    expect(await readFile(oldest, "utf8")).toBe("test")
+    expect(await readFile(nested, "utf8")).toBe("test")
+    expect(await readFile(gone, "utf8")).toBe("test")
+    expect(await Bun.file(orphan).exists()).toBe(false)
+  })
+
+  test("keeps a session opencode still has even when no listing returns it", async () => {
+    const hidden = await oldAttachment("ses_hidden")
+    const { hooks } = await storageHooks({ unlisted: ["ses_hidden"] })
+    await run([file({ name: "new.bin" })], {}, hooks)
+    expect(await readFile(hidden, "utf8")).toBe("test")
+  })
+
+  test("keeps an old attachment named by the message being materialized", async () => {
+    const cited = await oldAttachment("ses_cited")
+    const { hooks } = await storageHooks()
+    const text: Part = { id: "prt_text", sessionID: "ses_test", messageID: "msg_test", type: "text", text: `compare with ${cited}` }
+    await run([text, file({ name: "new.bin" })], {}, hooks)
+    expect(await readFile(cited, "utf8")).toBe("test")
   })
 
   test("never traverses symlinked session directories during accounting or cleanup", async () => {

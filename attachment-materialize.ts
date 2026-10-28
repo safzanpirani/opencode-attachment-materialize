@@ -226,7 +226,10 @@ const storageUsage = async (root: string) => {
   return usage
 }
 
-const cleanup = async (root: string, context: Parameters<Plugin>[0], currentSession?: string) => {
+// One listing per project; a full page means it may be truncated.
+const SESSION_LIST_LIMIT = 100_000
+
+const cleanup = async (root: string, context: Parameters<Plugin>[0], currentSession?: string, incoming = "") => {
   const candidates = new Map<string, string>()
   for (const name of await readdir(root)) {
     // Only opencode session directories are ours; never follow symlinks.
@@ -237,6 +240,14 @@ const cleanup = async (root: string, context: Parameters<Plugin>[0], currentSess
       candidates.set(name, directory)
     }
   }
+  const referenced = (text: string) => {
+    for (const [name, directory] of candidates) {
+      // Inspect all part types, including tool input/output and forked notes.
+      if (text.includes(JSON.stringify(directory).slice(1, -1))) candidates.delete(name)
+    }
+  }
+  // The incoming message is persisted only after this hook returns.
+  referenced(incoming)
   if (candidates.size === 0) return
 
   // A project-local list is insufficient: a fork or another project's history
@@ -247,8 +258,10 @@ const cleanup = async (root: string, context: Parameters<Plugin>[0], currentSess
   const directories = new Set([context.directory, ...projects.data.map((project) => project.worktree)])
   const sessions = new Map<string, { id: string; directory: string; parentID?: string }>()
   for (const directory of directories) {
-    const result = await context.client.session.list({ query: { directory }, throwOnError: true })
-    if (!result.data) throw new Error("cannot enumerate attachment sessions")
+    // Without scope and limit, opencode lists only the 100 newest sessions whose directory is exactly this one.
+    const query = { directory, scope: "project", limit: SESSION_LIST_LIMIT }
+    const result = await context.client.session.list({ query, throwOnError: true })
+    if (!result.data || result.data.length >= SESSION_LIST_LIMIT) throw new Error("cannot enumerate attachment sessions")
     for (const session of result.data) sessions.set(session.id, session)
   }
   for (const session of sessions.values()) {
@@ -261,15 +274,13 @@ const cleanup = async (root: string, context: Parameters<Plugin>[0], currentSess
       path: { id: session.id }, query: { directory: session.directory }, throwOnError: true,
     })
     if (!result.data) throw new Error("cannot enumerate attachment references")
-    for (const message of result.data) {
-      const history = JSON.stringify(message)
-      for (const [name, directory] of candidates) {
-        // Inspect all part types, including tool input/output and forked notes.
-        if (history.includes(JSON.stringify(directory).slice(1, -1))) candidates.delete(name)
-      }
-    }
+    for (const message of result.data) referenced(JSON.stringify(message))
   }
-  for (const directory of candidates.values()) await rm(directory, { recursive: true })
+  for (const [name, directory] of candidates) {
+    // Delete only what opencode confirms is gone: a listing can still miss a session.
+    const result = await context.client.session.get({ path: { id: name } })
+    if (result.response?.status === 404) await rm(directory, { recursive: true })
+  }
 }
 
 const save = async (
@@ -344,9 +355,9 @@ const save = async (
 
 export const AttachmentMaterialize: Plugin = async (context) => {
   const pending = new Set<string>()
-  const sweep = async (root: string, currentSession?: string) => {
+  const sweep = async (root: string, currentSession?: string, incoming?: string) => {
     try {
-      await cleanup(root, context, currentSession)
+      await cleanup(root, context, currentSession, incoming)
     } catch (error) {
       console.error(`[attachment-materialize] cleanup skipped: ${error instanceof Error ? error.message : String(error)}`)
     }
@@ -396,7 +407,9 @@ export const AttachmentMaterialize: Plugin = async (context) => {
                   files: quota("OPENCODE_ATTACHMENT_MAX_FILES", DEFAULT_TOTAL_FILES),
                 }
                 if (!swept) {
-                  await sweep(root, input.sessionID)
+                  // Data URLs carry only base64; every other part may name an existing attachment.
+                  const incoming = output.parts.filter((p) => p.type !== "file" || !p.url.startsWith("data:"))
+                  await sweep(root, input.sessionID, JSON.stringify(incoming))
                   swept = true
                 }
                 const usage = await storageUsage(root)
